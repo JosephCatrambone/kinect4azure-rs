@@ -6,29 +6,96 @@
 extern crate libc;
 
 use libc::{size_t, c_char};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, BorrowMut};
 use std::ffi::{CString};
 use std::mem::MaybeUninit;
 use std::os::raw::c_uint;
 use std::ptr::{self, null_mut, null};
+use std::slice;
+use byteorder::{LittleEndian, ByteOrder};
+use std::collections::VecDeque;
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 pub struct K4ADevice {
 	device: k4a_device_t,
 	capture_config: k4a_device_configuration_t,
 	serial_number: Option<String>, // Starts as None but becomes Some lazily.
-	tracker: Option<k4abt_tracker_t>
+	tracker: Option<k4abt_tracker_t>,
+	active_captures: VecDeque<K4ACapture>
 }
 
 pub struct K4ACapture {
 	capture: k4a_capture_t,
 	image: Option<k4a_image_t>,
-	body: Option<k4abt_frame_t>
+	frame: Option<k4abt_frame_t>,
+	skeleton: Option<k4abt_skeleton_t>
 }
 
 impl K4ADevice {
+	// Build a new device, start the tracker, and run.
+	pub fn new() -> Self {
+		let mut device:Self = K4ADevice::try_open(K4A_DEVICE_DEFAULT).expect("Failed to open device.");
+		device.start_capture();
+		device.start_tracker();
+		return device;
+	}
+	
+	pub fn next_frame(&mut self) {
+		// Queues a capture and does all the processing on it.
+		let cap = self.get_capture(-1).expect("Failed to synchronously queue frame.");
+		//self.queue_capture_for_processing(&cap, -1);
+		self.active_captures.push_back(cap);
+		println!("Grabbing new frame.  Buffer size: {}", self.active_captures.len());
+	}
+	
+	pub fn drop_oldest_capture(&mut self) {
+		if let Some(cap) = self.active_captures.pop_front() {
+			std::mem::drop(cap);
+			println!("Dropping oldest cap.");
+		}
+	}
+	
+	pub fn get_depth_image(&mut self) -> (usize, usize, Vec<u16>) {
+		let capture_obj: &mut K4ACapture = self.active_captures.front_mut().expect("No captures queued.");
+		let image:k4a_image_t = match capture_obj.image {
+			Some(img) => img,
+			None => {
+				unsafe {
+					let img: k4a_image_t = k4a_capture_get_depth_image(capture_obj.capture);
+					capture_obj.image = Some(img);
+					img
+				}
+			}
+		};
+		
+		unsafe {
+			let height = k4a_image_get_height_pixels(image) as usize;
+			let width = k4a_image_get_width_pixels(image) as usize;
+			let stride = k4a_image_get_stride_bytes(image) as usize;
+			let size = k4a_image_get_size(image) as usize;
+			
+			let mut result = Vec::<u16>::with_capacity(size/2);
+			result.set_len(size/2);
+			let buff:*const u8 = k4a_image_get_buffer(image);
+			let s = slice::from_raw_parts(buff, size);
+			//ptr::copy(buff, result.as_mut_ptr(), size);
+			LittleEndian::read_u16_into(s, result.as_mut_slice());
+			// Rust won't touch the ptr, so we don't need to mem::forget.
+			// It won't get dropped when it goes out of scope, but it's a pointer to the image data.
+			return (height, width, result);
+		}
+	}
+	
+	pub fn get_skeleton(&self) -> () {
+	
+	}
+	
+	//
+	// Internals
+	//
+	
 	// Get a Device.  The default one.  Any one.  May panic.
-	pub fn try_open(device_id:u32) -> Result<Self, String> {
+	fn try_open(device_id:u32) -> Result<Self, String> {
 		eprintln!("Trying to count devices.");
 		if device_get_installed_count() == 0 {
 			eprintln!("No devices available.");
@@ -44,8 +111,6 @@ impl K4ADevice {
 			if k4a_device_open(device_id as c_uint, k4a_device.as_mut_ptr()) != k4a_result_t::K4A_RESULT_SUCCEEDED {
 				eprintln!("device_open failed.");
 				return Result::Err("Unable to open device.".to_string());
-			} else {
-			
 			}
 			
 			eprintln!("Success: Opened device.");
@@ -65,6 +130,7 @@ impl K4ADevice {
 					},
 					serial_number: None,
 					tracker: None,
+					active_captures: VecDeque::new()
 				}
 			);
 		}
@@ -90,40 +156,38 @@ impl K4ADevice {
 		}
 	}
 	
-	pub fn set_config(&mut self, config:k4a_device_configuration_t) {
+	fn set_config(&mut self, config:k4a_device_configuration_t) {
 		self.capture_config = config;
 	}
 	
 	// BGRA32 uses extra CPU.  It is not a native format for the device.
-	pub fn start_capture(&mut self) {
+	fn start_capture(&mut self) {
 		unsafe {
 			let config_ptr: *mut k4a_device_configuration_t = &mut self.capture_config;
 			k4a_device_start_cameras(self.device, config_ptr);
 		}
 	}
 	
-	pub fn start_tracker(&mut self) {
-		//k4a_calibration_t sensor_calibration;
-		//k4a_device_get_calibration(device, deviceConfig.depth_mode, K4A_COLOR_RESOLUTION_OFF, &sensor_calibration);
-		let sensor_calibration = unsafe {
+	fn start_tracker(&mut self) {
+		unsafe {
+			//k4a_calibration_t sensor_calibration;
+			//k4a_device_get_calibration(device, deviceConfig.depth_mode, K4A_COLOR_RESOLUTION_OFF, &sensor_calibration);
 			let mut uninit_sensor_calibration = MaybeUninit::<k4a_calibration_t>::uninit();
-			k4a_device_get_calibration(self.device, self.capture_config.depth_mode, k4a_color_resolution_t::K4A_COLOR_RESOLUTION_OFF, uninit_sensor_calibration.as_mut_ptr());
-			uninit_sensor_calibration.assume_init()
-		};
-		
-		//k4abt_tracker_t tracker = NULL;
-		//k4abt_tracker_create(&sensor_calibration, &tracker);
-		let tracker = unsafe {
+			let device_get_result = k4a_device_get_calibration(self.device, self.capture_config.depth_mode, k4a_color_resolution_t::K4A_COLOR_RESOLUTION_OFF, uninit_sensor_calibration.as_mut_ptr());
+			let sensor_calibration = uninit_sensor_calibration.assume_init();
+			assert_eq!(device_get_result, k4a_result_t::K4A_RESULT_SUCCEEDED);
+			
+			//k4abt_tracker_t tracker = NULL;
+			//k4abt_tracker_create(&sensor_calibration, &tracker);
 			let mut uninit_tracker = MaybeUninit::<k4abt_tracker_t>::uninit();
-			k4abt_tracker_create(&sensor_calibration, uninit_tracker.as_mut_ptr());
-			uninit_tracker.assume_init()
-		};
-		
-		self.tracker = Some(tracker);
+			let tracker_create_result = k4abt_tracker_create(&sensor_calibration, uninit_tracker.as_mut_ptr());
+			assert_eq!(tracker_create_result, k4a_result_t::K4A_RESULT_SUCCEEDED);
+			self.tracker = Some(uninit_tracker.assume_init());
+		}
 	}
 	
 	// Use -1 for infinite wait for synchronous capture.
-	pub fn get_capture(&mut self, wait_time:i32) -> Result<K4ACapture, i32> {
+	fn get_capture(&mut self, wait_time:i32) -> Result<K4ACapture, i32> {
 		unsafe {
 			let mut uninit_capture = MaybeUninit::<k4a_capture_t>::uninit();
 			let res:i32 = k4a_device_get_capture(self.device, uninit_capture.as_mut_ptr(), wait_time);
@@ -131,7 +195,8 @@ impl K4ADevice {
 				k4a_wait_result_t::K4A_WAIT_RESULT_SUCCEEDED => Ok(K4ACapture {
 					capture: uninit_capture.assume_init(),
 					image: None,
-					body: None
+					frame: None,
+					skeleton: None
 				}),
 				e => Err(e) // _RESULT_FAILED, _RESULT_TIMEOUT
 			}
@@ -139,63 +204,27 @@ impl K4ADevice {
 	}
 	
 	// wait_time == -1 for infinite wait.
-	pub fn get_queued_capture(&mut self, wait_time:i32) -> Result<K4ACapture, i32> {
+	fn queue_capture_for_processing(&mut self, cap: &K4ACapture, wait_time:i32) -> i32 {
 		unsafe{
-			let mut uninit_cap = MaybeUninit::<k4a_capture_t>::uninit();
-			if let None = self.tracker {
-				println!("Tracker was not initialized.  Initializing.");
-				self.start_tracker();
-			}
-			let res:i32 = k4a_capture_create(uninit_cap.as_mut_ptr());
-			if res != k4a_wait_result_t::K4A_WAIT_RESULT_SUCCEEDED {
-				return Err(res);
-			}
-			let cap:k4a_capture_t = uninit_cap.assume_init();
 			//K4ABT_EXPORT k4a_wait_result_t k4abt_tracker_enqueue_capture(k4abt_tracker_t tracker_handle, k4a_capture_t sensor_capture_handle, int32_t timeout_in_ms);
-			let res:i32 = k4abt_tracker_enqueue_capture(self.tracker.expect("Tracker has not been initialized.  Did you call start tracker?"), cap, wait_time);
-			match res {
-				k4a_wait_result_t::K4A_WAIT_RESULT_SUCCEEDED => Ok(K4ACapture{
-					capture: cap,
-					image: None,
-					body: None
-				}),
-				e => Err(e)
-			}
-		}
-	}
-}
-
-impl K4ACapture {
-	pub fn get_depth_image(&mut self) -> (usize, usize, Vec<u8>) {
-		unsafe {
-			let image:k4a_image_t = k4a_capture_get_depth_image(self.capture);
-			let height = k4a_image_get_height_pixels(image) as usize;
-			let width = k4a_image_get_width_pixels(image) as usize;
-			let stride = k4a_image_get_stride_bytes(image) as usize;
-			let size = k4a_image_get_size(image) as usize;
-			self.image = Some(image);
-			let mut result = Vec::<u8>::with_capacity(size);
-			result.set_len(size);
-			let buff:*const u8 = k4a_image_get_buffer(image);
-			ptr::copy(buff, result.as_mut_ptr(), size);
-			// Rust won't touch the ptr, so we don't need to mem::forget.
-			// It won't get dropped when it goes out of scope, but it's a pointer to the image data.
-			return (height, width, result);
+			k4abt_tracker_enqueue_capture(self.tracker.expect("Tracker has not been initialized.  Did you call start tracker?"), cap.capture, wait_time)
 		}
 	}
 	
-	pub fn get_body_frame(&mut self) {
-		/*
-k4abt_frame_t body_frame = NULL;
-k4a_wait_result_t pop_frame_result = k4abt_tracker_pop_result(tracker, &body_frame, 0);
-if (pop_frame_result == K4A_WAIT_RESULT_SUCCEEDED)
-{
-    // Successfully popped the body tracking result. Start your processing
-    ...
-
-    k4abt_frame_release(body_frame); // Remember to release the body frame once you finish using it
-}
-	*/
+	// wait_time == -1 for infinite wait.  Maybe fills the K4A capture with k4abt_frame data.
+	fn fetch_tracking_result(&mut self, cap: &mut K4ACapture, wait_time:i32) -> i32 {
+		unsafe {
+			let mut uninit_frame = MaybeUninit::<k4abt_frame_t>::uninit();
+			let res = k4abt_tracker_pop_result(self.tracker.expect("Tracker uninitialized."), uninit_frame.as_mut_ptr(), wait_time);
+			if res == k4a_wait_result_t::K4A_WAIT_RESULT_SUCCEEDED {
+				cap.frame = Some(uninit_frame.assume_init());
+			}
+			return res;
+		}
+	}
+	
+	fn get_skeleton_result(&mut self, cap: &mut K4ACapture, wait_time:i32) -> i32 {
+		return 0;
 	}
 }
 
@@ -222,7 +251,7 @@ impl Drop for K4ACapture {
 			if let Some(im) = self.image {
 				k4a_image_release(im);
 			}
-			if let Some(frame) = self.body {
+			if let Some(frame) = self.frame {
 				k4abt_frame_release(frame);
 			}
 			k4a_capture_release(self.capture);
